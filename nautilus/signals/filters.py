@@ -234,13 +234,13 @@ class NoiseFilterStack:
     @classmethod
     def default(cls) -> "NoiseFilterStack":
         return cls(
-            # LOOSE MODE: minimal filters to see what trades trigger
-            volume=VolumeActivityFilter(min_volume_ratio=0.1),      # was 0.4 — allow thin candles
-            wave=WaveQualityFilter(min_range_bps=2.0, max_stacked_imb=20.0),  # was 8.0, 6.0 — very permissive
+            # Production defaults: block low-quality market states before signals.
+            volume=VolumeActivityFilter(min_volume_ratio=0.4),
+            wave=WaveQualityFilter(min_range_bps=8.0, max_stacked_imb=6.0),
             vp_filter=VolumeProfileReadinessFilter(
-                require_hvn_structure=False,  # was True — allow entries anywhere
-                reject_at_lvn=False,          # was True — ALLOW entries at LVN
-                require_valid=False,          # was True — allow VP to warm up
+                require_hvn_structure=True,
+                reject_at_lvn=True,
+                require_valid=True,
             ),
-            session=SessionQualityFilter(require_active=False),  # was True — trade all times
+            session=SessionQualityFilter(require_active=True),
         )

@@ -13,25 +13,50 @@ require_orderbook: false  # backtesting without live order book
 # ── Volume Profile configuration ──────────────────────────────────────────────
 vp_config:
   bucket_size: 10.0
-  window_trades: 8000
+  window_trades: 50000
   value_area_pct: 0.70
   hvn_percentile: 0.75
   lvn_percentile: 0.25
-  proximity_bps: 15.0
-  min_buckets: 10
-  stop_buffer_bps: 5.0
+  proximity_bps: 8.0
+  min_buckets: 50
+  stop_buffer_bps: 20.0
+  poc_band_bps: 8.0
+  va_band_bps: 10.0
   session_mode: false
+
+# ── Heatmap configuration ────────────────────────────────────────────────────
+# Structural support/resistance walls for entry/exit
+# stop_buffer_bps: CRITICAL — how far BEYOND the wall to place stops.
+#   Default 5 bps = too tight (stops in noise). Use 40 bps for wicks.
+heatmap_config:
+  bucket_size: 50.0
+  window_trades: 8000
+  wall_percentile: 0.80
+  proximity_bps: 15.0
+  min_walls: 2
+  ob_weight: 1.5
+  stop_buffer_bps: 40.0
 
 # ── Signal configuration ──────────────────────────────────────────────────────
 signals_config:
   long:
+    - poc_acceptance_retest_long
+    - vah_acceptance_long
     - hvn_absorption_long
     - hvn_divergence_long
-    - poc_reclaim_long
   short:
-    - hvn_absorption_short
-    - hvn_divergence_short
-    - poc_rejection_short
+    - poc_acceptance_retest_short
+    - val_acceptance_short
+  module_kwargs:
+    poc_band_bps: 12.0
+    va_band_bps: 15.0
+    acceptance_evals: 1
+    retest_band_bps: 18.0
+    retest_window_evals: 12
+    absorption_min: 0.08
+    ob_imb_min: 0.05
+    min_hvn_volume_pct: 0.02
+    require_htf_align: true
 
 signal:
   imbalance_threshold: 0.20
@@ -56,6 +81,9 @@ risk:
   max_leverage: 3.0
   loss_cooldown_secs: 0
   min_hold_secs: 0
+  risk_per_trade_pct: 0.0025
+  min_stop_bps: 12.0
+  max_stop_bps: 250.0
 
 execution:
   use_market_entries: true
@@ -63,4 +91,7 @@ execution:
   stoploss_pct: 0.015
   trailing_trigger_pct: 0.012
   trailing_offset_pct: 0.006
-  max_time_in_trade_secs: 1200
+  # 20m time stop will chop trend trades; use longer hold window for acceptance systems.
+  max_time_in_trade_secs: 43200
+  min_hold_secs: 60
+  acceptance_failure_secs: 60.0

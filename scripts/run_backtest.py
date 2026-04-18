@@ -1,17 +1,17 @@
 """
-scripts/run_backtest.py — Wire the catalog into a Nautilus BacktestEngine.
+Fast tick-level Nautilus backtest runner for the existing OrderflowStrategy.
 
-Assumes download_backtest_data.py has already been run.
-
-Usage
------
-    python scripts/run_backtest.py --start 2024-10-01 --end 2025-01-01
-    python scripts/run_backtest.py --start 2024-10-01 --end 2025-01-01 --config config/backtest.yaml
+Loads tick Parquet files, wires the strategy into BacktestEngine, and exports:
+- trade logs
+- pnl summary
+- equity curve
 """
 
 from __future__ import annotations
 
 import argparse
+import json
+import sys
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -20,201 +20,296 @@ from nautilus_trader.backtest.engine import BacktestEngine, BacktestEngineConfig
 from nautilus_trader.backtest.models import FillModel, LatencyModel
 from nautilus_trader.config import LoggingConfig
 from nautilus_trader.model.currencies import USDT
-from nautilus_trader.model.enums import AccountType, OmsType, book_type_from_str
-from nautilus_trader.model.identifiers import InstrumentId, Symbol, Venue
+from nautilus_trader.model.enums import AccountType, BookType, OmsType
+from nautilus_trader.model.identifiers import Venue
 from nautilus_trader.model.objects import Money
-from nautilus_trader.persistence.catalog import ParquetDataCatalog
 from nautilus_trader.test_kit.providers import TestInstrumentProvider
 
-from nautilus.config.schema import OrderflowStrategyConfig, SignalsConfig
+# Ensure local project modules are importable when run as a script.
+ROOT = Path(__file__).resolve().parents[1]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+
+from nautilus.config.loader import load_orderflow_config
+from nautilus.config.schema import orderflow_strategy_config_from_stack
+from nautilus.data.ticks import parquet_ticks_to_trade_ticks
 from nautilus.strategy.orderflow_strategy import OrderflowStrategy
 
 
-CATALOG_DIR = Path("data/catalog")
+def _parse_iso_utc(value: str) -> datetime:
+    dt = datetime.fromisoformat(value)
+    if dt.tzinfo is None:
+        return dt.replace(tzinfo=UTC)
+    return dt.astimezone(UTC)
 
 
-def build_engine(start: datetime, end: datetime, initial_balance: float = 10_000.0) -> BacktestEngine:
+def _collect_parquet_files(parquet_path: Path) -> list[Path]:
+    if parquet_path.is_file():
+        if parquet_path.suffix.lower() != ".parquet":
+            raise SystemExit(
+                f"Expected a Parquet file (*.parquet), got: {parquet_path}. "
+                "This runner only supports Parquet tick input."
+            )
+        return [parquet_path]
+    files = sorted(parquet_path.glob("**/*.parquet"))
+    if not files:
+        raise SystemExit(
+            f"No Parquet files found under: {parquet_path}. "
+            "Provide a .parquet file or a directory containing .parquet files."
+        )
+    return [p for p in files if p.is_file()]
+
+
+def build_engine(
+    *,
+    initial_balance: float,
+    slippage_prob: float,
+    latency_ms: int,
+) -> tuple[BacktestEngine, object]:
     engine = BacktestEngine(
         config=BacktestEngineConfig(
-            logging=LoggingConfig(log_level="WARNING"),   # reduce noise
+            logging=LoggingConfig(log_level="WARNING"),
             run_analysis=True,
         )
     )
 
-    # Venue: simulated Binance with realistic latency + slippage
     engine.add_venue(
         venue=Venue("BINANCE"),
         oms_type=OmsType.NETTING,
         account_type=AccountType.MARGIN,
+        book_type=BookType.L1_MBP,
         base_currency=None,
         starting_balances=[Money(initial_balance, USDT)],
         fill_model=FillModel(
-            prob_fill_on_limit=0.8,      # limit order fill probability
-            prob_slippage=0.3,           # slippage on market orders
+            prob_fill_on_limit=0.8,
+            prob_slippage=slippage_prob,
             random_seed=42,
         ),
         latency_model=LatencyModel(
-            base_latency_nanos=int(50e6),   # 50ms base latency
+            base_latency_nanos=int(latency_ms * 1_000_000),
         ),
-        book_type=book_type_from_str("L2_MBP"),
     )
 
-    # Instrument
-    instrument = TestInstrumentProvider.btcusdt_binance()
+    instrument = TestInstrumentProvider.btcusdt_perp_binance()
     engine.add_instrument(instrument)
+    return engine, instrument
 
-    # Load data from catalog
-    catalog = ParquetDataCatalog(str(CATALOG_DIR))
-    start_ns = int(start.timestamp() * 1e9)
-    end_ns   = int(end.timestamp() * 1e9)
 
-    trade_ticks = catalog.trade_ticks(
-        instrument_ids=[str(instrument.id)],
-        start=start_ns,
-        end=end_ns,
-    )
-    if not trade_ticks:
-        raise RuntimeError(
-            f"No trade ticks found in catalog for range {start} → {end}. "
-            "Run download_backtest_data.py first."
+def _load_tick_data(
+    *,
+    parquet_path: Path,
+    instrument,
+    start: datetime,
+    end: datetime,
+) -> list:
+    ticks = []
+    start_ms = int(start.timestamp() * 1e3)
+    end_ms = int(end.timestamp() * 1e3)
+    for file_path in _collect_parquet_files(parquet_path):
+        chunk = parquet_ticks_to_trade_ticks(
+            file_path,
+            instrument,
+            start_ts_ms=start_ms,
+            end_ts_ms=end_ms,
         )
-    engine.add_data(trade_ticks)
+        if not chunk:
+            continue
+        ticks.extend(chunk)
+    ticks.sort(key=lambda t: t.ts_event)
+    return ticks
 
-    bars = catalog.bars(
-        instrument_ids=[str(instrument.id)],
-        bar_types=["BTCUSDT.BINANCE-1-HOUR-LAST-EXTERNAL"],
-        start=start_ns,
-        end=end_ns,
+
+def _export_outputs(
+    *,
+    output_dir: Path,
+    initial_balance: float,
+    final_balance: float,
+    metrics_dir: Path,
+    fee_maker_bps: float,
+    fee_taker_bps: float,
+) -> None:
+    output_dir.mkdir(parents=True, exist_ok=True)
+    pnl = final_balance - initial_balance
+    pnl_pct = (pnl / initial_balance * 100.0) if initial_balance else 0.0
+
+    metric_files = sorted(metrics_dir.glob("orderflow_metrics_*.jsonl"))
+    if not metric_files:
+        summary = {
+            "initial_balance_usdt": initial_balance,
+            "final_balance_usdt": final_balance,
+            "net_pnl_usdt": pnl,
+            "net_pnl_pct": pnl_pct,
+            "estimated_fees_usdt": 0.0,
+            "fee_adjusted_pnl_usdt": pnl,
+            "fee_adjusted_pnl_pct": pnl_pct,
+            "fee_assumptions_bps": {"maker": fee_maker_bps, "taker": fee_taker_bps},
+        }
+        (output_dir / "pnl_summary.json").write_text(json.dumps(summary, indent=2), encoding="utf-8")
+        pd.DataFrame(columns=["event_idx", "event", "realized_pnl", "equity"]).to_csv(
+            output_dir / "equity_curve.csv",
+            index=False,
+        )
+        pd.DataFrame(columns=["event_idx", "event", "price", "qty", "side", "fee"]).to_csv(
+            output_dir / "trade_logs.csv",
+            index=False,
+        )
+        return
+
+    rows: list[dict] = []
+    for line in metric_files[-1].read_text(encoding="utf-8").splitlines():
+        if line.strip():
+            rows.append(json.loads(line))
+
+    fills = []
+    equity_rows = []
+    equity = initial_balance
+    estimated_fees = 0.0
+    event_idx = 0
+    taker_fee_rate = fee_taker_bps / 10_000.0
+    for row in rows:
+        event_idx += 1
+        event = row.get("event")
+        data = row.get("data", {})
+        if event == "fill":
+            px = data.get("price")
+            qty = data.get("qty")
+            fee = data.get("fee")
+            est_fee = 0.0
+            if fee is None and px is not None and qty is not None:
+                try:
+                    est_fee = float(px) * float(qty) * taker_fee_rate
+                except (TypeError, ValueError):
+                    est_fee = 0.0
+            elif fee is not None:
+                try:
+                    est_fee = float(fee)
+                except (TypeError, ValueError):
+                    est_fee = 0.0
+            estimated_fees += est_fee
+            fills.append(
+                {
+                    "event_idx": event_idx,
+                    "event": event,
+                    "price": px,
+                    "qty": qty,
+                    "side": data.get("side"),
+                    "fee": fee,
+                    "estimated_fee": est_fee,
+                }
+            )
+        elif event == "position_closed":
+            realized = float(data.get("realized_pnl", 0.0))
+            equity += realized
+            equity_rows.append(
+                {
+                    "event_idx": event_idx,
+                    "event": event,
+                    "realized_pnl": realized,
+                    "equity": equity,
+                }
+            )
+
+    pd.DataFrame(fills).to_csv(output_dir / "trade_logs.csv", index=False)
+    pd.DataFrame(equity_rows).to_csv(output_dir / "equity_curve.csv", index=False)
+    fee_adj_pnl = pnl - estimated_fees
+    fee_adj_pct = (fee_adj_pnl / initial_balance * 100.0) if initial_balance else 0.0
+    summary = {
+        "initial_balance_usdt": initial_balance,
+        "final_balance_usdt": final_balance,
+        "net_pnl_usdt": pnl,
+        "net_pnl_pct": pnl_pct,
+        "estimated_fees_usdt": estimated_fees,
+        "fee_adjusted_pnl_usdt": fee_adj_pnl,
+        "fee_adjusted_pnl_pct": fee_adj_pct,
+        "fee_assumptions_bps": {"maker": fee_maker_bps, "taker": fee_taker_bps},
+    }
+    (output_dir / "pnl_summary.json").write_text(json.dumps(summary, indent=2), encoding="utf-8")
+
+
+def run(args: argparse.Namespace) -> None:
+    output_dir = args.output_dir.resolve()
+    metrics_dir = output_dir / "metrics"
+    print(f"Backtest range: {args.start.isoformat()} -> {args.end.isoformat()}")
+    print(f"Parquet source: {args.parquet}")
+    print(f"Output dir:     {output_dir}")
+
+    engine, instrument = build_engine(
+        initial_balance=args.balance,
+        slippage_prob=args.slippage_prob,
+        latency_ms=args.latency_ms,
     )
-    if bars:
-        engine.add_data(bars)
-    else:
-        print("WARNING: no 1h bars found — HTF structure engine will not fire")
 
-    # Strategy config — mirrors live.yaml but with backtest-safe overrides
-    strategy_config = OrderflowStrategyConfig(
-        instrument_id=instrument.id,
-        client_id="BINANCE",
-        order_id_tag="BT-001",
-
-        # Timeframes
-        timeframe="5m",
-        htf_timeframe="1h",
-
-        # Features
-        lookback_candles=50,
-        price_bucket_size=1.0,
-        large_trade_pct=0.90,
-        cvd_smoothing=5,
-        divergence_window=3,
-        swing_window=5,
-
-        # Book (disable for backtest — no live OB replay)
-        book_depth=5,
-        book_type="L2_MBP",
-        require_orderbook=False,     # no L2 replay → disable OB gate
-
-        # VP config
-        vp_config={
-            "bucket_size": 10.0,
-            "window_trades": 8_000,
-            "value_area_pct": 0.70,
-            "hvn_percentile": 0.75,
-            "lvn_percentile": 0.25,
-            "proximity_bps": 15.0,
-            "min_buckets": 10,
-            "stop_buffer_bps": 5.0,
-            "session_mode": False,
-        },
-
-        # Signals
-        signals_config=SignalsConfig(
-            long=["hvn_absorption_long", "hvn_divergence_long", "poc_reclaim_long"],
-            short=["hvn_absorption_short", "hvn_divergence_short", "poc_rejection_short"],
-        ),
-
-        # Signal thresholds
-        imbalance_threshold=0.20,
-        absorption_min=0.08,
-        ob_imb_threshold=0.05,
-
-        # Risk
-        max_position_fraction=0.25,
-        max_notional_usdt=20_000.0,
-        max_daily_loss_pct=3.0,
-        max_consecutive_losses=4,
-        max_spread_bps=999.0,        # disabled in backtest (no live spread data)
-        stale_tick_ms=5_000.0,
-        min_top_of_book_qty=0.0,     # disabled
-        kill_switch_path=None,
-        max_leverage=3.0,
-        equity_state_path=None,      # no disk persistence in backtest
-        loss_cooldown_secs=90.0,
-
-        # Execution
-        use_market_entries=True,
-        entry_post_only=False,
-        stoploss_pct=0.015,
-        target_pct=0.030,
-        trailing_trigger_pct=0.012,
-        trailing_offset_pct=0.006,
-        min_hold_secs=15.0,
-        max_time_in_trade_secs=1200.0,
-        eval_throttle_ms=200,
-
-        # Logging
-        log_metrics=False,           # turn on if you want per-event CSV output
-        metrics_dir="data/bt_metrics",
+    print("Loading strategy config ...")
+    stack_cfg = load_orderflow_config(args.config)
+    base_cfg = orderflow_strategy_config_from_stack(stack_cfg)
+    cfg_keys = getattr(base_cfg.__class__, "__annotations__", {}).keys()
+    cfg_values = {k: getattr(base_cfg, k) for k in cfg_keys}
+    cfg_values.update(
+        {
+            "instrument_id": instrument.id,
+            "require_orderbook": False,
+            "log_metrics": True,
+            "metrics_dir": str(metrics_dir),
+        }
     )
+    strategy_cfg = base_cfg.__class__(**cfg_values)
+    strategy = OrderflowStrategy(config=strategy_cfg)
+    # Backtest must use engine portfolio/fills, not the strategy's paper wallet.
+    if hasattr(strategy, "_paper_mode"):
+        strategy._paper_mode = False
+    engine.add_strategy(strategy)
 
-    engine.add_strategy(OrderflowStrategy(config=strategy_config))
-    return engine
+    print("Loading tick Parquet ...")
+    ticks = _load_tick_data(
+        parquet_path=args.parquet,
+        instrument=instrument,
+        start=args.start,
+        end=args.end,
+    )
+    if not ticks:
+        raise SystemExit("No ticks loaded for selected range.")
+    print(f"Ticks loaded: {len(ticks):,}")
+    engine.add_data(ticks)
 
+    print("Running backtest ...")
+    engine.run(start=args.start, end=args.end)
 
-def run(start: datetime, end: datetime, initial_balance: float = 10_000.0) -> None:
-    print(f"Backtest: {start.date()} → {end.date()}  |  balance: ${initial_balance:,.0f}")
-    print("Building engine …")
-
-    engine = build_engine(start, end, initial_balance)
-
-    print("Running …")
-    engine.run(start=start, end=end)
-
-    # ── Results ───────────────────────────────────────────────────────────
-    stats = engine.get_result()
     account = engine.portfolio.account(Venue("BINANCE"))
-
-    print()
-    print("=" * 50)
-    print("BACKTEST RESULTS")
-    print("=" * 50)
-
-    if stats:
-        for k, v in stats.items():
-            print(f"  {k:<35} {v}")
-
+    final_balance = args.balance
     if account:
         bal = account.balance(USDT)
         if bal:
-            final  = float(bal.total.as_double())
-            pnl    = final - initial_balance
-            pnl_pct = pnl / initial_balance * 100
-            print()
-            print(f"  Final balance:   ${final:>12,.2f}")
-            print(f"  Net PnL:         ${pnl:>+12,.2f}  ({pnl_pct:+.2f}%)")
+            final_balance = float(bal.total.as_double())
 
-    print("=" * 50)
+    _export_outputs(
+        output_dir=output_dir,
+        initial_balance=args.balance,
+        final_balance=final_balance,
+        metrics_dir=metrics_dir,
+        fee_maker_bps=args.fee_maker_bps,
+        fee_taker_bps=args.fee_taker_bps,
+    )
+    print(f"Final balance: {final_balance:,.2f} USDT")
+    print(f"PnL summary:   {(output_dir / 'pnl_summary.json')}")
+    print(f"Trade logs:    {(output_dir / 'trade_logs.csv')}")
+    print(f"Equity curve:  {(output_dir / 'equity_curve.csv')}")
     engine.dispose()
 
 
 def parse_args() -> argparse.Namespace:
-    p = argparse.ArgumentParser(description="Run Nautilus backtest from local catalog.")
-    p.add_argument("--start", required=True, type=lambda s: datetime.fromisoformat(s).replace(tzinfo=UTC))
-    p.add_argument("--end",   required=True, type=lambda s: datetime.fromisoformat(s).replace(tzinfo=UTC))
-    p.add_argument("--balance", type=float, default=10_000.0, help="Initial USDT balance")
+    p = argparse.ArgumentParser(description="Fast tick-level Nautilus backtest runner.")
+    p.add_argument("--config", type=Path, required=True, help="Strategy YAML (existing strategy config).")
+    p.add_argument("--parquet", type=Path, required=True, help="Parquet file or directory of files.")
+    p.add_argument("--start", required=True, type=_parse_iso_utc, help="ISO datetime, UTC if naive.")
+    p.add_argument("--end", required=True, type=_parse_iso_utc, help="ISO datetime, UTC if naive.")
+    p.add_argument("--balance", type=float, default=10_000.0, help="Initial USDT balance.")
+    p.add_argument("--fee-maker-bps", type=float, default=2.0, help="Maker fee in bps.")
+    p.add_argument("--fee-taker-bps", type=float, default=4.0, help="Taker fee in bps.")
+    p.add_argument("--slippage-prob", type=float, default=0.30, help="Fill slippage probability [0,1].")
+    p.add_argument("--latency-ms", type=int, default=50, help="Base latency in milliseconds.")
+    p.add_argument("--output-dir", type=Path, default=Path("backtest_output"), help="Output folder.")
     return p.parse_args()
 
 
 if __name__ == "__main__":
-    args = parse_args()
-    run(start=args.start, end=args.end, initial_balance=args.balance)
+    run(parse_args())

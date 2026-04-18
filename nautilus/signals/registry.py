@@ -44,7 +44,7 @@ class SignalRegistry:
         """
         Evaluate all LONG signal modules.
 
-        Returns list of EntrySignal objects that pass all conditions.
+        Returns all EntrySignal objects that pass conditions.
         """
         signals: list = []
         for module in self._modules:
@@ -53,15 +53,13 @@ class SignalRegistry:
             result = module.evaluate(snapshot, structure, session, vp)
             if result:
                 signals.append(result)
-                if not self._require_all:
-                    break
         return signals
 
     def evaluate_short(self, snapshot, structure, session, vp=None):
         """
         Evaluate all SHORT signal modules.
 
-        Returns list of EntrySignal objects that pass all conditions.
+        Returns all EntrySignal objects that pass conditions.
         """
         signals: list = []
         for module in self._modules:
@@ -70,8 +68,6 @@ class SignalRegistry:
             result = module.evaluate(snapshot, structure, session, vp)
             if result:
                 signals.append(result)
-                if not self._require_all:
-                    break
         return signals
 
     @classmethod
@@ -92,24 +88,32 @@ class SignalRegistry:
         from nautilus.signals.long import (
             HVNAbsorptionLong,
             HVNDivergenceLong,
+            POCAcceptanceRetestLong,
             POCReclaimLong,
+            VAHAcceptanceLong,
             VALBounceLong,
         )
         from nautilus.signals.short import (
             HVNAbsorptionShort,
             HVNDivergenceShort,
+            POCAcceptanceRetestShort,
             POCRejectionShort,
+            VALAcceptanceShort,
             VAHRejectionShort,
         )
 
         module_map = {
             "hvn_absorption_long": HVNAbsorptionLong,
             "hvn_divergence_long": HVNDivergenceLong,
+            "poc_acceptance_retest_long": POCAcceptanceRetestLong,
             "poc_reclaim_long": POCReclaimLong,
+            "vah_acceptance_long": VAHAcceptanceLong,
             "val_bounce_long": VALBounceLong,
             "hvn_absorption_short": HVNAbsorptionShort,
             "hvn_divergence_short": HVNDivergenceShort,
+            "poc_acceptance_retest_short": POCAcceptanceRetestShort,
             "poc_rejection_short": POCRejectionShort,
+            "val_acceptance_short": VALAcceptanceShort,
             "vah_rejection_short": VAHRejectionShort,
         }
 

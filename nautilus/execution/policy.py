@@ -134,6 +134,45 @@ def estimate_order_qty(
     return q.as_decimal()
 
 
+def estimate_order_qty_from_risk(
+    instrument: "Instrument",
+    *,
+    equity: float,
+    entry_price: float,
+    stop_price: float,
+    risk_per_trade_pct: float,
+    max_fraction: float,
+    max_notional_usdt: float | None,
+) -> Decimal:
+    """
+    Risk-based sizing: size so the loss at the structural stop equals
+    (equity * risk_per_trade_pct), then clamp by max_fraction / max_notional.
+    """
+    if equity <= 0 or entry_price <= 0:
+        return instrument.make_qty(0).as_decimal()
+
+    stop_dist = abs(entry_price - stop_price)
+    if stop_dist <= 0:
+        return instrument.make_qty(0).as_decimal()
+
+    risk_per_trade_pct = max(0.0, float(risk_per_trade_pct))
+    risk_amount = equity * risk_per_trade_pct
+    if risk_amount <= 0:
+        return instrument.make_qty(0).as_decimal()
+
+    qty_risk = risk_amount / stop_dist
+
+    # Clamp by fraction-of-equity notional
+    max_fraction = max(0.0, min(1.0, float(max_fraction)))
+    available = equity * max_fraction
+    if max_notional_usdt is not None:
+        available = min(available, float(max_notional_usdt))
+    qty_cap = available / entry_price if entry_price > 0 and available > 0 else 0.0
+
+    qty = min(qty_risk, qty_cap) if qty_cap > 0 else qty_risk
+    return instrument.make_qty(max(0.0, qty)).as_decimal()
+
+
 def build_entry_order(
     order_factory: OrderFactory,
     instrument: Instrument,

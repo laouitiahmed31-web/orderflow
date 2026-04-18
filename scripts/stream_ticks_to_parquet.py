@@ -9,10 +9,6 @@ Format: agg_id, price, qty, first_trade_id, last_trade_id, ts_ms, buyer_maker, i
 """
 
 import argparse
-import gzip
-import io
-import os
-import tempfile
 from pathlib import Path
 from zipfile import ZipFile
 
@@ -20,8 +16,10 @@ import pandas as pd
 import pyarrow as pa
 import pyarrow.parquet as pq
 
-# Binance aggTrades columns (in order)
-AGGTRADES_COLUMNS = [
+# Binance aggTrades variants:
+# 8 cols: agg_id,price,qty,first_id,last_id,ts,buyer_maker,is_best_price
+# 7 cols: agg_id,price,qty,first_id,last_id,ts,buyer_maker
+AGGTRADES_COLUMNS_8 = [
     "agg_id",
     "price",
     "qty",
@@ -30,6 +28,15 @@ AGGTRADES_COLUMNS = [
     "ts_ms",
     "buyer_maker",
     "is_best_price",
+]
+AGGTRADES_COLUMNS_7 = [
+    "agg_id",
+    "price",
+    "qty",
+    "first_trade_id",
+    "last_trade_id",
+    "ts_ms",
+    "buyer_maker",
 ]
 
 
@@ -52,22 +59,62 @@ def stream_zip_to_ticks(zip_path: Path, chunk_size: int = 500_000) -> tuple[pd.D
         print(f"  Reading {csv_file} ({zf.getinfo(csv_file).file_size / 1e9:.2f} GB uncompressed)...")
         
         with zf.open(csv_file) as f:
-            # Read CSV with needed columns including agg_id for trade_id
+            # Sniff first line to support both 7-col and 8-col aggTrades.
+            first_line = f.readline().decode("utf-8", errors="ignore").strip()
+            col_count = first_line.count(",") + 1 if first_line else 0
+            first_token = first_line.split(",", 1)[0].strip().strip('"').strip("'").lower()
+            has_header = not first_token.isdigit()
+            f.seek(0)
+
+            if col_count == 7:
+                names = AGGTRADES_COLUMNS_7
+            elif col_count == 8:
+                names = AGGTRADES_COLUMNS_8
+            else:
+                raise ValueError(
+                    f"Unsupported aggTrades column count {col_count} in {csv_file}; expected 7 or 8."
+                )
+
+            # Read CSV with needed columns including agg_id for trade_id.
             df = pd.read_csv(
                 f,
-                names=AGGTRADES_COLUMNS,
+                names=names,
                 usecols=["agg_id", "ts_ms", "price", "qty", "buyer_maker"],
+                header=None,
+                skiprows=1 if has_header else 0,
                 dtype={
-                    "agg_id": "int64",
-                    "price": "float32",
-                    "qty": "float32",
-                    "ts_ms": "int64",
-                    "buyer_maker": "bool",
+                    "agg_id": "string",
+                    "price": "string",
+                    "qty": "string",
+                    "ts_ms": "string",
+                    "buyer_maker": "string",
                 },
             )
+
+            # Robust numeric parsing for mixed/dirty rows.
+            df["agg_id"] = pd.to_numeric(df["agg_id"], errors="coerce")
+            df["ts_ms"] = pd.to_numeric(df["ts_ms"], errors="coerce")
+            df["price"] = pd.to_numeric(df["price"], errors="coerce")
+            df["qty"] = pd.to_numeric(df["qty"], errors="coerce")
+            bm = df["buyer_maker"].astype(str).str.lower().str.strip()
+            df["buyer_maker"] = bm.isin(["true", "1"])
+            df = df.dropna(subset=["agg_id", "ts_ms", "price", "qty"]).copy()
+            df["agg_id"] = df["agg_id"].astype("int64")
+            df["ts_ms"] = df["ts_ms"].astype("int64")
+            df["price"] = df["price"].astype("float32")
+            df["qty"] = df["qty"].astype("float32")
             
-            # Convert timestamp from microseconds to milliseconds
-            df["ts_ms"] = df["ts_ms"] // 1000
+            # Normalize timestamp to milliseconds.
+            # Binance aggTrades can arrive in ms/us/ns depending on source.
+            ts_sample = int(df["ts_ms"].dropna().iloc[0]) if not df.empty else 0
+            if ts_sample >= 10**18:      # ns -> ms
+                df["ts_ms"] = df["ts_ms"] // 1_000_000
+            elif ts_sample >= 10**15:    # us -> ms
+                df["ts_ms"] = df["ts_ms"] // 1_000
+            elif ts_sample >= 10**12:    # already ms
+                pass
+            else:                        # seconds -> ms
+                df["ts_ms"] = df["ts_ms"] * 1_000
             
             # Filter out zero-quantity trades (invalid for backtest)
             df = df[df["qty"] > 0].copy()
@@ -115,7 +162,7 @@ def process_zip_file(
     2. Convert to tick format
     3. Write Parquet
     """
-    print(f"\n📦 Processing {zip_path.name}...")
+    print(f"\n Processing {zip_path.name}...")
     
     ticks_df, month_date = stream_zip_to_ticks(zip_path)
     
@@ -146,7 +193,7 @@ def main():
     )
     args = parser.parse_args()
     
-    print(f"📊 Streaming aggTrades to Parquet")
+    print(f" Streaming aggTrades to Parquet")
     print(f"Output: {args.output}")
     print(f"Symbol: {args.symbol}")
     print(f"Files: {len(args.zip_files)}")
@@ -158,7 +205,7 @@ def main():
         
         process_zip_file(zip_path, args.output, args.symbol)
     
-    print("\n✅ Done! Parquet files ready for backtest.")
+    print("\n Done! Parquet files ready for backtest.")
 
 
 if __name__ == "__main__":

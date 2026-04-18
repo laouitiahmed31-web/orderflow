@@ -49,6 +49,7 @@ from nautilus.execution.policy import (
     build_exit_order,
     compute_bracket_prices,
     estimate_order_qty,
+    estimate_order_qty_from_risk,
     should_cancel_stale_limit,
 )
 from nautilus.features.heatmap import LiquidityHeatmap, HeatmapSnapshot
@@ -113,6 +114,8 @@ class OrderflowStrategy(Strategy):
         # ── Volume Profile ────────────────────────────────────────────────
         from nautilus.features.volume_profile import VolumeProfile
         vp_cfg = getattr(config, "vp_config", None) or {}
+        self._poc_band_bps = float(vp_cfg.get("poc_band_bps", 8.0))
+        self._va_band_bps = float(vp_cfg.get("va_band_bps", 10.0))
         self._vp_engine = VolumeProfile(
             bucket_size=vp_cfg.get("bucket_size", 10.0),
             window_trades=vp_cfg.get("window_trades", 8_000),
@@ -122,6 +125,8 @@ class OrderflowStrategy(Strategy):
             proximity_bps=vp_cfg.get("proximity_bps", 15.0),
             min_buckets=vp_cfg.get("min_buckets", 10),
             stop_buffer_bps=vp_cfg.get("stop_buffer_bps", 5.0),
+            poc_band_bps=vp_cfg.get("poc_band_bps", 8.0),
+            va_band_bps=vp_cfg.get("va_band_bps", 10.0),
             session_mode=vp_cfg.get("session_mode", False),
         )
         self._vp: VolumeProfileSnapshot | None = None
@@ -185,10 +190,20 @@ class OrderflowStrategy(Strategy):
         
         # Track VP warmup for logging
         self._vp_was_cold: bool = True
+        self._tick_count: int = 0
 
         # Wall-anchored bracket prices (set at entry, drive exits)
         self._entry_stop_price: float | None = None    # structural stop
         self._entry_target_price: float | None = None  # structural target
+
+        # Acceptance-failure exits (for breakout/acceptance entries)
+        self._accept_level_price: float | None = None
+        self._accept_band_bps: float | None = None
+        self._accept_fail_count: int = 0
+        self._accept_fail_needed: int = int(getattr(config, "acceptance_failure_evals", 2))
+        self._accept_fail_ns: int = 0
+        self._accept_fail_last_ns: int | None = None
+        self._accept_fail_needed_secs: float = float(getattr(config, "acceptance_failure_secs", 60.0))
 
         # ── Cooldown state ─────────────────────────────────────────────────
         self._loss_cooldown_until_ns: int = 0
@@ -241,6 +256,7 @@ class OrderflowStrategy(Strategy):
     # ── Data handlers ──────────────────────────────────────────────────────────
 
     def on_trade_tick(self, tick: TradeTick) -> None:
+        self._tick_count += 1
         self._last_tick_ns = tick.ts_event
         self._last_price = float(tick.price)  # Track for paper trading
         
@@ -248,7 +264,12 @@ class OrderflowStrategy(Strategy):
         if raw is None:
             return
 
-        self.log.info(f"[TICK] {tick.price} @ {tick.size} | VP: {self._vp_engine.bucket_count} buckets | Eval throttle: {self.config.eval_throttle_ms}ms")
+        # Keep tick logging sparse for fast backtests.
+        if self._tick_count % 500_000 == 0:
+            self.log.info(
+                f"[TICK] processed={self._tick_count:,} "
+                f"last={tick.price}@{tick.size} vp_buckets={self._vp_engine.bucket_count}"
+            )
         self._engine.add_tick(raw["ts"], raw["price"], raw["qty"], raw["side"])
 
         # Feed heatmap on every trade
@@ -435,12 +456,13 @@ class OrderflowStrategy(Strategy):
         # ── Evaluate signals (long and short in parallel) ─────────────────
         # Run noise filter for each direction, then evaluate signals.
         
-        # Status check: log what's ready
-        if not self._vp_engine.is_warm:
-            vp_pct = (self._vp_engine.bucket_count / getattr(self.config, "vp_config", {}).get("min_buckets", 10)) * 100
-            if int(vp_pct) % 25 == 0 and vp_pct > 0:  # Log at 25%, 50%, 75%
-                self.log.debug(f"[STATUS] VP warming: {vp_pct:.0f}% | Heatmap: {'ready' if self._heatmap_engine.is_warm else 'warming'}")
-            return  # Can't process signals without VP
+        # Status check: require heatmap to be warm (structural stops must be reliable)
+        if not self._heatmap_engine.is_warm:
+            hm_tape = self._heatmap_engine.tape_length
+            hm_min = int(self._heatmap_engine._tape.maxlen * 0.20) if hasattr(self._heatmap_engine, '_tape') else 1000
+            if hm_tape % 1000 == 0 and hm_tape > 0:  # Log every 1000 tapes
+                self.log.debug(f"[STATUS] Heatmap warming: {hm_tape}/{hm_min} tapes (20% threshold)")
+            return  # Can't process signals without warm heatmap for structural stops
         
         long_signal  = self._evaluate_direction(snap, session, is_long=True)
         short_signal = self._evaluate_direction(snap, session, is_long=False)
@@ -464,34 +486,84 @@ class OrderflowStrategy(Strategy):
         if eq is None or eq <= 0:
             return
 
-        ml_confidence = self._inference_hook.predict(
-            self._build_feature_row(snap, session, signal)
+        ml_confidence = float(
+            self._inference_hook.predict(self._build_feature_row(snap, session, signal))
         )
         if ml_confidence <= 0:
             return
 
-        effective_fraction = cfg.max_position_fraction * ml_confidence
+        # Combine model confidence with signal module confidence for sizing.
+        sig_conf = float(getattr(signal, "confidence", 1.0))
+        combined_conf = max(0.0, min(1.0, ml_confidence)) * max(0.0, min(1.0, sig_conf))
 
+        # ── Store structural bracket prices (HEATMAP stops + VP targets) ──
+        # FIX: Use HEATMAP for stops (real structural support/resistance walls)
+        # Use VP only for acceptance entry targets (POC/VAH/VAL objectives)
+        # This prevents being stopped in the value area noise.
+        if self._heatmap is not None:
+            if signal.side == OrderSide.BUY:
+                # Structural stop from heatmap wall
+                self._entry_stop_price = self._heatmap.long_stop_price
+                # Target: use VP for acceptance trades, heatmap otherwise
+                if "acceptance" in signal.label and self._vp is not None and self._vp.is_valid:
+                    candidates = [
+                        self._vp.long_target_price,
+                        self._vp.long_travel_target_price,
+                        self._vp.vah_price,
+                    ]
+                    candidates = [c for c in candidates if c is not None and c > px]
+                    self._entry_target_price = max(candidates) if candidates else self._heatmap.long_target_price
+                else:
+                    self._entry_target_price = self._heatmap.long_target_price
+            else:  # SHORT
+                # Structural stop from heatmap wall
+                self._entry_stop_price = self._heatmap.short_stop_price
+                # Target: use VP for acceptance trades, heatmap otherwise
+                if "acceptance" in signal.label and self._vp is not None and self._vp.is_valid:
+                    candidates = [
+                        self._vp.short_target_price,
+                        self._vp.short_travel_target_price,
+                        self._vp.val_price,
+                    ]
+                    candidates = [c for c in candidates if c is not None and c < px]
+                    self._entry_target_price = min(candidates) if candidates else self._heatmap.short_target_price
+                else:
+                    self._entry_target_price = self._heatmap.short_target_price
+        else:
+            self._entry_stop_price   = None
+            self._entry_target_price = None
+
+        # Reject entries without structural stop (risk sizing requires it)
+        if self._entry_stop_price is None:
+            if self._metrics:
+                self._metrics.log_event("entry_rejected", {"failed": ["no_structural_stop"]})
+            return
+
+        # Stop distance gates (institutional noise/tail control)
+        stop_bps = abs(px - self._entry_stop_price) / px * 10_000.0
+        min_stop_bps = float(getattr(cfg, "min_stop_bps", 0.0))
+        max_stop_bps = float(getattr(cfg, "max_stop_bps", 10_000.0))
+        if stop_bps < min_stop_bps or stop_bps > max_stop_bps:
+            if self._metrics:
+                self._metrics.log_event("entry_rejected", {"failed": ["stop_bps_out_of_bounds"]})
+            return
+
+        # Risk-based sizing with hard clamps
         # Use fake balance for paper trading so quantity validation doesn't fail
         qty_calc_balance = 10000.0 if self._paper_mode else eq
+        qty = estimate_order_qty_from_risk(
+            inst,
+            equity=qty_calc_balance,
+            entry_price=px,
+            stop_price=float(self._entry_stop_price),
+            risk_per_trade_pct=float(getattr(cfg, "risk_per_trade_pct", 0.0)) * combined_conf,
+            max_fraction=float(getattr(cfg, "max_position_fraction", 0.0)),
+            max_notional_usdt=getattr(cfg, "max_notional_usdt", None),
+        )
 
-        try:
-            qty = estimate_order_qty(
-                inst,
-                side=signal.side,
-                quote_balance=qty_calc_balance,
-                price=px,
-                max_fraction=effective_fraction,
-                max_notional_usdt=cfg.max_notional_usdt,
-            )
-        except ValueError as e:
-            self.log.warning(f"[QTY] Quantity calc failed: {e} | Balance: {qty_calc_balance:.4f} USDT @ {px:.2f} | fraction: {effective_fraction:.4f}")
-            if self._metrics:
-                self._metrics.log_event("entry_rejected", {"failed": ["insufficient_balance_for_qty"]})
-            return
-        
         if qty <= 0:
-            self.log.debug(f"[QTY] Zero quantity calculated | Balance: {eq:.4f} USDT @ {px:.2f}")
+            if self._metrics:
+                self._metrics.log_event("entry_rejected", {"failed": ["zero_qty_risk_sizer"]})
             return
 
         notional = float(qty) * px
@@ -500,7 +572,8 @@ class OrderflowStrategy(Strategy):
 
         try:
             order = build_entry_order(
-                self.order_factory, inst,
+                self.order_factory,
+                inst,
                 side=signal.side,
                 price=px,
                 qty=qty,
@@ -511,26 +584,28 @@ class OrderflowStrategy(Strategy):
             self.log.warning(f"Entry order build failed: {exc}")
             return
 
-        # ── Store wall-anchored bracket prices ─────────────────────────────
-        # FIX 7: Use VP stop/target (same engine that fired the signal).
-        # Heatmap is secondary fallback only when VP isn't warm yet.
-        if self._vp is not None and self._vp.is_valid:
+        # Geometry validation - reject entries with excessive stop distances
+        if self._entry_stop_price is not None and self._entry_target_price is not None:
             if signal.side == OrderSide.BUY:
-                self._entry_stop_price   = self._vp.long_stop_price
-                self._entry_target_price = self._vp.long_target_price
-            else:
-                self._entry_stop_price   = self._vp.short_stop_price
-                self._entry_target_price = self._vp.short_target_price
-        elif self._heatmap is not None:
-            if signal.side == OrderSide.BUY:
-                self._entry_stop_price   = self._heatmap.long_stop_price
-                self._entry_target_price = self._heatmap.long_target_price
-            else:
-                self._entry_stop_price   = self._heatmap.short_stop_price
-                self._entry_target_price = self._heatmap.short_target_price
-        else:
-            self._entry_stop_price   = None
-            self._entry_target_price = None
+                risk = (px - self._entry_stop_price) / px
+                reward = (self._entry_target_price - px) / px
+            else:  # SELL
+                risk = (self._entry_stop_price - px) / px
+                reward = (px - self._entry_target_price) / px
+            
+            if risk <= 0.0 or reward <= 0.0:
+                self.log.warning(f"[ENTRY] Invalid geometry: risk={risk:.4f}, reward={reward:.4f}")
+                return
+            
+            rr = reward / risk
+            max_stop_bps = getattr(cfg, "max_structural_stop_bps", 35.0)
+            min_rr = getattr(cfg, "min_structural_rr", 1.2)
+            risk_bps = risk * 10_000.0
+            
+            self.log.info(f"[ENTRY] Geometry check: risk={risk_bps:.1f}bps, max={max_stop_bps:.1f}bps, rr={rr:.2f}, min={min_rr:.2f}")
+            if risk_bps > max_stop_bps or rr < min_rr:
+                self.log.warning(f"[ENTRY] Geometry rejected: risk={risk_bps:.1f}bps > {max_stop_bps:.1f}bps, rr={rr:.2f} < {min_rr:.2f}")
+                return
 
         self._entry_price         = px
         self._entry_side          = signal.side
@@ -539,8 +614,25 @@ class OrderflowStrategy(Strategy):
         self._position_open_ts_ns = self.clock.timestamp_ns()
         self._last_signal         = signal
         self._pending_limit_price = px if not cfg.use_market_entries else None
+        # Configure acceptance failure level based on entry type.
+        self._accept_level_price = None
+        self._accept_band_bps = None
+        self._accept_fail_count = 0
+        if self._vp is not None and self._vp.is_valid:
+            if signal.label in ("poc_acceptance_retest_long", "poc_acceptance_retest_short"):
+                self._accept_level_price = self._vp.poc_price
+                self._accept_band_bps = self._poc_band_bps
+            elif signal.label == "vah_acceptance_long":
+                self._accept_level_price = self._vp.vah_price
+                self._accept_band_bps = self._va_band_bps
+            elif signal.label == "val_acceptance_short":
+                self._accept_level_price = self._vp.val_price
+                self._accept_band_bps = self._va_band_bps
 
-        self.log.info(f"[SIGNAL] {signal.side.name} @ {px:.2f} | {signal.label} (conf={ml_confidence:.3f}) qty={qty:.4f}")
+        self.log.info(
+            f"[SIGNAL] {signal.side.name} @ {px:.2f} | {signal.label} "
+            f"(conf={combined_conf:.3f}) qty={qty:.4f} stop_bps={stop_bps:.1f}"
+        )
         self.submit_order(order, client_id=self._client_id)
         self._is_pending = True
 
@@ -582,9 +674,32 @@ class OrderflowStrategy(Strategy):
             if is_long
             else self._signals.evaluate_short(snap, self._structure, session, vp=self._vp)
         )
-        signal = (signals or [None])[0]
+        signal = None
+        if signals:
+            # Prefer higher-confidence modules; tie-break by richer condition set.
+            signal = max(signals, key=lambda s: (float(s.confidence), len(s.conditions)))
+
+        # ── Regime bias gate (institutional: trade with HTF structure) ──────────
+        # This prevents counter-trend shorts in bull runs (and vice versa) which
+        # are typically just noise stops in trend.
+        if signal is not None:
+            trend = getattr(self._structure, "trend", None)
+            trend_val = getattr(trend, "value", None)
+            if signal.side == OrderSide.SELL:
+                # Only short in bearish regime, or on active breakdown BOS.
+                if trend_val != "bearish":
+                    if not (self._structure.structure_break and self._structure.break_type == "low"):
+                        return None
+            if signal.side == OrderSide.BUY:
+                # Only long in bullish regime, or on active upside BOS.
+                if trend_val != "bullish":
+                    if not (self._structure.structure_break and self._structure.break_type == "high"):
+                        return None
         if signal:
-            self.log.debug(f"[{direction}] Signal fired: {signal.label} (conf={signal.confidence:.3f})")
+            self.log.debug(
+                f"[{direction}] Signal fired: {signal.label} "
+                f"(conf={signal.confidence:.3f}, candidates={len(signals)})"
+            )
         return signal
 
     # ── Exit ───────────────────────────────────────────────────────────────────
@@ -619,8 +734,37 @@ class OrderflowStrategy(Strategy):
             self._exit_all("hard_stop", position_side)
             return
 
-        # ── 2. Structural stop (wall break) ────────────────────────────────
-        # If the wall we entered at breaks, the thesis is dead. Exit immediately.
+        # ── 2. Acceptance-failure exit (breakout entries) ──────────────────
+        # For breakout/acceptance trades, the thesis fails when price persists
+        # back through the acceptance boundary (POC/VAH/VAL band), not on a 1-tick
+        # probe into the structural stop zone.
+        if self._accept_level_price is not None and self._accept_band_bps is not None:
+            band = self._accept_band_bps / 10_000.0
+            if position_side == OrderSide.BUY:
+                failed = px < (self._accept_level_price * (1.0 - band))
+            else:
+                failed = px > (self._accept_level_price * (1.0 + band))
+            if failed:
+                now_ns = self.clock.timestamp_ns()
+                if self._accept_fail_last_ns is None:
+                    self._accept_fail_last_ns = now_ns
+                dt = max(0, now_ns - self._accept_fail_last_ns)
+                self._accept_fail_last_ns = now_ns
+                self._accept_fail_ns += dt
+                self._accept_fail_count += 1
+                if (
+                    self._accept_fail_ns >= int(max(0.0, self._accept_fail_needed_secs) * 1e9)
+                    or self._accept_fail_count >= max(1, self._accept_fail_needed)
+                ):
+                    self._exit_all("acceptance_fail", position_side)
+                    return
+            else:
+                self._accept_fail_count = 0
+                self._accept_fail_ns = 0
+                self._accept_fail_last_ns = None
+
+        # ── 3. Structural stop (disaster line) ─────────────────────────────
+        # If price hard breaks through the structural stop, exit immediately.
         if self._entry_stop_price is not None:
             if position_side == OrderSide.BUY and px <= self._entry_stop_price:
                 self._exit_all("wall_break_stop", position_side)
@@ -629,23 +773,40 @@ class OrderflowStrategy(Strategy):
                 self._exit_all("wall_break_stop", position_side)
                 return
 
-        # ── 3. Minimum hold time (suppress further exits until elapsed) ────
+        # ── 4. Minimum hold time (suppress further exits until elapsed) ────
         min_hold_secs = getattr(cfg, "min_hold_secs", 10.0)
         if self._position_open_ts_ns is not None and min_hold_secs > 0:
             held_secs = (self.clock.timestamp_ns() - self._position_open_ts_ns) / 1e9
             if held_secs < min_hold_secs:
                 return
 
-        # ── 4. Structural profit target (next wall) ─────────────────────────
+        # ── 5. Structural profit target (next wall) ─────────────────────────
         if self._entry_target_price is not None:
             if position_side == OrderSide.BUY and px >= self._entry_target_price:
+                # Acceptance trades should not fully exit at the first objective.
+                # Convert objective hit into "runner mode": activate trailing and
+                # remove the target so we don't scalp tiny wins.
+                if self._last_signal and "acceptance" in self._last_signal.label:
+                    self._trailing_active = True
+                    self._trailing_peak = max(self._trailing_peak, px)
+                    self._entry_target_price = None
+                    if self._metrics:
+                        self._metrics.log_event("target_to_trailing", {"side": "BUY", "px": px})
+                    return
                 self._exit_all("wall_target_hit", position_side)
                 return
             if position_side == OrderSide.SELL and px <= self._entry_target_price:
+                if self._last_signal and "acceptance" in self._last_signal.label:
+                    self._trailing_active = True
+                    self._trailing_peak = min(self._trailing_peak, px)
+                    self._entry_target_price = None
+                    if self._metrics:
+                        self._metrics.log_event("target_to_trailing", {"side": "SELL", "px": px})
+                    return
                 self._exit_all("wall_target_hit", position_side)
                 return
 
-        # ── 5. Trailing stop ─────────────────────────────────────────────────
+        # ── 6. Trailing stop ─────────────────────────────────────────────────
         if pnl_pct >= self._bracket.trailing_trigger_pct:
             self._trailing_active = True
 
@@ -661,7 +822,7 @@ class OrderflowStrategy(Strategy):
                 self._exit_all("trailing_stop", position_side)
                 return
 
-        # ── 6. Time stop ─────────────────────────────────────────────────────
+        # ── 7. Time stop ─────────────────────────────────────────────────────
         if cfg.max_time_in_trade_secs is not None and self._position_open_ts_ns is not None:
             open_secs = (self.clock.timestamp_ns() - self._position_open_ts_ns) / 1e9
             if open_secs >= cfg.max_time_in_trade_secs:
@@ -696,6 +857,11 @@ class OrderflowStrategy(Strategy):
         self._pending_limit_price = None
         self._entry_stop_price    = None
         self._entry_target_price  = None
+        self._accept_level_price  = None
+        self._accept_band_bps     = None
+        self._accept_fail_count   = 0
+        self._accept_fail_ns      = 0
+        self._accept_fail_last_ns = None
         self._is_pending          = False   # FIX: was missing, caused stuck state
 
     # ── Cancel-replace stale limit ─────────────────────────────────────────────
@@ -796,6 +962,11 @@ class OrderflowStrategy(Strategy):
         self._position_open_ts_ns = None
         self._entry_stop_price    = None
         self._entry_target_price  = None
+        self._accept_level_price  = None
+        self._accept_band_bps     = None
+        self._accept_fail_count   = 0
+        self._accept_fail_ns      = 0
+        self._accept_fail_last_ns = None
 
         if self._metrics:
             eq = self._quote_balance()
@@ -880,7 +1051,11 @@ class OrderflowStrategy(Strategy):
             return
         
         # Live mode: submit real order
-        self.log.info(f"[LIVE] Submitting real order: {order.side} {order.quantity} @ {order.price}")
+        price = getattr(order, "price", None)
+        if price is None:
+            self.log.info(f"[LIVE] Submitting real order: {order.side} {order.quantity} @ MARKET")
+        else:
+            self.log.info(f"[LIVE] Submitting real order: {order.side} {order.quantity} @ {price}")
         super().submit_order(order, *args, **kwargs)
 
     def on_data(self, data: Data) -> None:

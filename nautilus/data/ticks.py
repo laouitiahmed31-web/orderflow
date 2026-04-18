@@ -7,6 +7,7 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any
 
+import numpy as np
 import pandas as pd
 from nautilus_trader.model.data import TradeTick
 from nautilus_trader.model.enums import AggressorSide
@@ -37,6 +38,8 @@ def parquet_ticks_to_trade_ticks(
     instrument: Instrument,
     *,
     ts_init_delta: int = 0,
+    start_ts_ms: int | None = None,
+    end_ts_ms: int | None = None,
 ) -> list:
     """
     Load ``tick_recorder.py`` Parquet (columns: ts, price, qty, side, agg_id).
@@ -46,35 +49,54 @@ def parquet_ticks_to_trade_ticks(
     list[TradeTick]
     """
     path = Path(parquet_path)
-    df = pd.read_parquet(path)
+    # Column projection keeps Parquet reads fast for large files.
+    df = pd.read_parquet(path, columns=["ts", "price", "qty", "side", "agg_id"])
     if df.empty:
         return []
 
-    df = df.sort_values("ts")
-    # Map side string -> BUY/SELL for wrangler
-    def _side_row(r) -> str:
-        s = str(r["side"]).lower()
-        if s in ("buy", "b", "true"):
-            return "BUY"
-        if s in ("sell", "s", "false"):
-            return "SELL"
-        return "BUY"
+    df["ts"] = pd.to_numeric(df["ts"], errors="coerce").astype("Int64")
+    df["price"] = pd.to_numeric(df["price"], errors="coerce")
+    df["qty"] = pd.to_numeric(df["qty"], errors="coerce")
+    df = df.dropna(subset=["ts", "price", "qty"]).copy()
+    if df.empty:
+        return []
+    # Normalize ts to milliseconds for downstream filtering and conversion.
+    ts_sample = int(df["ts"].dropna().iloc[0])
+    if ts_sample >= 10**18:      # ns
+        df["ts"] = df["ts"] // 1_000_000
+    elif ts_sample >= 10**15:    # us
+        df["ts"] = df["ts"] // 1_000
+    elif ts_sample >= 10**12:    # ms
+        pass
+    else:                        # seconds
+        df["ts"] = df["ts"] * 1_000
+    if start_ts_ms is not None:
+        df = df[df["ts"] >= start_ts_ms]
+    if end_ts_ms is not None:
+        df = df[df["ts"] <= end_ts_ms]
+    if df.empty:
+        return []
 
-    df["side"] = df.apply(_side_row, axis=1)
+    # Stable sort preserves file order for equal timestamps.
+    df = df.sort_values(["ts", "agg_id"], kind="mergesort")
+
+    # Vectorized side mapping (no row-wise apply).
+    side_raw = df["side"].astype(str).str.lower()
+    is_buy = side_raw.isin(["buy", "b", "true", "1"])
+    is_sell = side_raw.isin(["sell", "s", "false", "0"])
+    df["side"] = np.where(is_sell, "SELL", np.where(is_buy, "BUY", "BUY"))
+
     df["trade_id"] = df["agg_id"].astype(str)
-    
-    # Scale quantity by 1M to preserve decimal precision (BTC has small decimals)
-    # E.g., 0.00001 BTC -> 10 (units)
-    df["quantity"] = (df["qty"].astype(float) * 1_000_000).astype("int64")
-    df["quantity"] = df["quantity"].clip(lower=1)  # Ensure minimum 1
-    
-    df["price"] = df["price"].astype(float)
-    df["timestamp"] = pd.to_datetime(df["ts"], unit="ms", utc=True)
-    
-    # Filter out duplicates
-    df = df.drop_duplicates(subset=["timestamp", "trade_id"]).copy()
+    df["quantity"] = (df["qty"] * 1_000_000).round().clip(lower=1).astype("int64")
+
+    # Ensure strictly increasing timestamps for wrangler/index.
+    tie_idx = df.groupby("ts", sort=False).cumcount()
+    ts_ns = df["ts"].astype("int64") * 1_000_000 + tie_idx
+    df["timestamp"] = pd.to_datetime(ts_ns, unit="ns", utc=True)
+    df = df.drop_duplicates(subset=["timestamp", "trade_id"], keep="first").copy()
+    df = df.sort_values("timestamp", kind="mergesort")
     print(f"  Loaded {len(df):,} unique ticks")
-    
+
     df = df.set_index("timestamp")
 
     wrangler = TradeTickDataWrangler(instrument=instrument)

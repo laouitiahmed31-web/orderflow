@@ -59,16 +59,24 @@ class VolumeProfileSnapshot:
     val_price: Optional[float] = None          # Value Area Low
     poc_distance_bps: float = 9999.0           # distance from current price to POC
 
-    hvn_above: list[VolumeNode] = field(default_factory=list)   # HVNs above current price
-    hvn_below: list[VolumeNode] = field(default_factory=list)   # HVNs below current price
+    # Band proximity (used for acceptance / retest logic)
+    at_poc: bool = False                       # within poc_band_bps of POC
+    at_vah: bool = False                       # within va_band_bps of VAH
+    at_val: bool = False                       # within va_band_bps of VAL
+
+    hvn_above: list[VolumeNode] = field(default_factory=list)   # HVNs above current price (EXCLUDES POC)
+    hvn_below: list[VolumeNode] = field(default_factory=list)   # HVNs below current price (EXCLUDES POC)
     lvn_above: list[VolumeNode] = field(default_factory=list)   # LVNs above current price
     lvn_below: list[VolumeNode] = field(default_factory=list)   # LVNs below current price
 
-    # Nearest actionable levels
+    # Nearest actionable levels (EXCLUDES POC unless explicitly requested)
     nearest_hvn_above: Optional[VolumeNode] = None
     nearest_hvn_below: Optional[VolumeNode] = None
     nearest_lvn_above: Optional[VolumeNode] = None
     nearest_lvn_below: Optional[VolumeNode] = None
+
+    # POC as its own node (context, not an HVN target)
+    poc_node: Optional[VolumeNode] = None
 
     # Proximity flags (price is AT a meaningful level)
     at_hvn: bool = False                # within proximity_bps of any HVN
@@ -84,6 +92,10 @@ class VolumeProfileSnapshot:
     long_target_price: Optional[float] = None  # nearest HVN above (or VAH)
     short_stop_price: Optional[float] = None   # just above nearest HVN above
     short_target_price: Optional[float] = None # nearest HVN below (or VAL)
+
+    # Travel targets (LVN fast zones) — useful for breakout systems
+    long_travel_target_price: Optional[float] = None   # nearest LVN above (if any)
+    short_travel_target_price: Optional[float] = None  # nearest LVN below (if any)
 
     # Profile quality
     total_volume: float = 0.0
@@ -132,13 +144,15 @@ class VolumeProfile:
     def __init__(
         self,
         bucket_size: float = 10.0,
-        window_trades: int = 8_000,
+        window_trades: int = 50_000,
         value_area_pct: float = 0.70,
         hvn_percentile: float = 0.75,
         lvn_percentile: float = 0.25,
-        proximity_bps: float = 15.0,
-        min_buckets: int = 10,
-        stop_buffer_bps: float = 5.0,
+        proximity_bps: float = 8.0,
+        min_buckets: int = 100,
+        stop_buffer_bps: float = 20.0,
+        poc_band_bps: float = 8.0,
+        va_band_bps: float = 10.0,
         session_mode: bool = False,
     ) -> None:
         self._bucket       = bucket_size
@@ -149,6 +163,8 @@ class VolumeProfile:
         self._proximity    = proximity_bps
         self._min_buckets  = min_buckets
         self._stop_buf     = stop_buffer_bps
+        self._poc_band_bps = poc_band_bps
+        self._va_band_bps  = va_band_bps
         self._session_mode = session_mode
 
         # Volume distribution: bucket_key → cumulative volume
@@ -216,6 +232,7 @@ class VolumeProfile:
         hvn_below: list[VolumeNode] = []
         lvn_above: list[VolumeNode] = []
         lvn_below: list[VolumeNode] = []
+        poc_node: VolumeNode | None = None
 
         for b, vol in buckets:
             lp = self._to_price(b)
@@ -224,15 +241,22 @@ class VolumeProfile:
                 continue   # at current price — ignore
 
             vol_pct = vol / self._total_volume
-            is_poc  = (b == poc_b)
-            ntype   = "POC" if is_poc else ("HVN" if vol >= hvn_thresh else ("LVN" if vol <= lvn_thresh else None))
+            is_poc = (b == poc_b)
+            ntype = (
+                "POC"
+                if is_poc
+                else ("HVN" if vol >= hvn_thresh else ("LVN" if vol <= lvn_thresh else None))
+            )
             if ntype is None:
                 continue
 
             node = VolumeNode(price=lp, volume=vol, volume_pct=vol_pct,
                               distance_bps=dist, node_type=ntype)
 
-            if ntype in ("HVN", "POC"):
+            if ntype == "POC":
+                # Keep POC separate: it's context/fair value, not an HVN target.
+                poc_node = node
+            elif ntype == "HVN":
                 if lp > current_price:
                     hvn_above.append(node)
                 else:
@@ -268,6 +292,16 @@ class VolumeProfile:
         above_poc = current_price > poc_price
         below_poc = current_price < poc_price
 
+        at_poc = poc_dist <= self._poc_band_bps
+        at_vah = (
+            vah_price is not None
+            and abs(current_price - vah_price) / current_price * 10_000.0 <= self._va_band_bps
+        )
+        at_val = (
+            val_price is not None
+            and abs(current_price - val_price) / current_price * 10_000.0 <= self._va_band_bps
+        )
+
         # ── Bracket prices ────────────────────────────────────────────────
         buf = self._stop_buf / 10_000.0
 
@@ -283,11 +317,19 @@ class VolumeProfile:
         )
         short_target = nearest_hvn_below.price if nearest_hvn_below else val_price
 
+        # LVN travel targets for breakout systems (fast zones, often first take-profit)
+        long_travel_target = nearest_lvn_above.price if nearest_lvn_above else None
+        short_travel_target = nearest_lvn_below.price if nearest_lvn_below else None
+
+        
         return VolumeProfileSnapshot(
             poc_price=poc_price,
             vah_price=vah_price,
             val_price=val_price,
             poc_distance_bps=poc_dist,
+            at_poc=at_poc,
+            at_vah=at_vah,
+            at_val=at_val,
             hvn_above=hvn_above,
             hvn_below=hvn_below,
             lvn_above=lvn_above,
@@ -296,6 +338,7 @@ class VolumeProfile:
             nearest_hvn_below=nearest_hvn_below,
             nearest_lvn_above=nearest_lvn_above,
             nearest_lvn_below=nearest_lvn_below,
+            poc_node=poc_node,
             at_hvn=at_hvn,
             at_hvn_below=at_hvn_below,
             at_hvn_above=at_hvn_above,
@@ -307,6 +350,8 @@ class VolumeProfile:
             long_target_price=long_target,
             short_stop_price=short_stop,
             short_target_price=short_target,
+            long_travel_target_price=long_travel_target,
+            short_travel_target_price=short_travel_target,
             total_volume=self._total_volume,
             is_valid=True,
         )

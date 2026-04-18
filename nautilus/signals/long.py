@@ -8,6 +8,7 @@ LVN awareness: divergence signal explicitly checks we're not at an LVN.
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from typing import TYPE_CHECKING, Optional
 
 from nautilus_trader.model.enums import OrderSide
@@ -80,7 +81,21 @@ class HVNAbsorptionLong(SignalModule):
             # trend != "bearish" compares enum to str → always True (filter never fires).
             "htf_not_bearish":    (not self._htf_align) or structure.trend.value != "bearish",
         }
-        return self._make_signal(conditions)
+        def _scale(x: float, lo: float, hi: float) -> float:
+            if hi <= lo:
+                return 1.0
+            return max(0.0, min(1.0, (x - lo) / (hi - lo)))
+
+        # Confidence: stronger absorption/OB + meaningful HVN volume.
+        hvn_pct = hvn.volume_pct if hvn is not None else 0.0
+        conf = min(
+            1.0,
+            0.35
+            + 0.35 * _scale(of.absorption, abs_min, abs_min * 2.0)
+            + 0.20 * _scale(of.ob_imbalance, self._ob_min, self._ob_min * 2.0)
+            + 0.10 * _scale(hvn_pct, self._min_hvn, self._min_hvn * 2.0),
+        )
+        return self._make_signal(conditions, confidence=conf)
 
 
 # ════════════════════════════════════════════════════════════════════════════════
@@ -136,7 +151,22 @@ class HVNDivergenceLong(SignalModule):
                 structure.trend.value != "bearish" or structure.structure_break
             ),
         }
-        return self._make_signal(conditions)
+        def _scale(x: float, lo: float, hi: float) -> float:
+            if hi <= lo:
+                return 1.0
+            return max(0.0, min(1.0, (x - lo) / (hi - lo)))
+
+        hvn_pct = hvn.volume_pct if hvn is not None else 0.0
+        # Divergence signal: emphasize divergence + OB + HVN quality.
+        conf = min(
+            1.0,
+            0.35
+            + 0.25 * (1.0 if of.delta_div == -1.0 else 0.0)
+            + 0.20 * _scale(of.ob_imbalance, self._ob_min, self._ob_min * 2.0)
+            + 0.10 * _scale(hvn_pct, self._min_hvn, self._min_hvn * 2.0)
+            + 0.10 * _scale(of.absorption, -self._abs_max, self._abs_max),
+        )
+        return self._make_signal(conditions, confidence=conf)
 
 
 # ════════════════════════════════════════════════════════════════════════════════
@@ -159,6 +189,8 @@ class POCReclaimLong(SignalModule):
         ob_imb_min: float = 0.08,
         imb_min: float = 0.12,
         poc_proximity_bps: float = 20.0,      # how close to POC counts as "at POC"
+        poc_absorption_min: float = 0.08,     # POC-specific absorption requirement
+        poc_ob_imb_min: float = 0.08,         # POC-specific OB imbalance requirement
         require_htf_align: bool = True,
         **_,
     ) -> None:
@@ -166,7 +198,14 @@ class POCReclaimLong(SignalModule):
         self._ob_min     = ob_imb_min
         self._imb_min    = imb_min
         self._poc_prox   = poc_proximity_bps
+        self._poc_abs_min = poc_absorption_min
+        self._poc_ob_min = poc_ob_imb_min
         self._htf_align  = require_htf_align
+        # Track previous signed distance to detect true reclaim events.
+        # NOTE: POC itself moves as the VP window rolls; we must guard against false
+        # "crosses" caused by POC moving rather than price crossing.
+        self._prev_poc_price: float | None = None
+        self._prev_signed_dist_bps: float | None = None
 
     def evaluate(
         self,
@@ -182,22 +221,53 @@ class POCReclaimLong(SignalModule):
 
         of = snap.ltf.flow
 
-        # Price must be within poc_proximity_bps of POC and above it (reclaim)
+        # Price must be within poc_proximity_bps of POC and do a true reclaim cross.
         poc_close = vp.poc_distance_bps <= self._poc_prox
-        reclaiming = vp.above_poc   # price just crossed above POC
+        signed_dist_bps = (snap.ltf.close_price - vp.poc_price) / vp.poc_price * 10_000.0
+
+        # Guard: require POC stability across evaluations (avoid false crosses).
+        max_poc_move_bps = 6.0
+        poc_move_bps = (
+            abs(vp.poc_price - self._prev_poc_price) / vp.poc_price * 10_000.0
+            if self._prev_poc_price is not None else 0.0
+        )
+
+        reclaiming = (
+            self._prev_signed_dist_bps is not None
+            and self._prev_signed_dist_bps <= -1.0
+            and signed_dist_bps >= 1.0
+            and poc_move_bps <= max_poc_move_bps
+        )
 
         conditions = {
             "near_poc":          poc_close,
             "poc_reclaim":       reclaiming,
             "not_at_lvn":        not vp.at_lvn,
-            "absorption_hold":   of.absorption >= self._abs_min,
+            "absorption_hold":   of.absorption >= self._poc_abs_min,  # Use POC-specific
             "cvd_rising":        snap.ltf.cvd_rising,
+            "ob_bid_present":    of.ob_imbalance >= self._poc_ob_min,  # Use POC-specific
             "buy_imbalance":     of.imbalance >= self._imb_min,
             "not_reversing":     of.stacked_imb >= 1,
             "no_bearish_div":    of.delta_div != 1.0,
             "htf_not_bearish":   (not self._htf_align) or structure.trend.value != "bearish",
         }
-        return self._make_signal(conditions)
+        # Update state after computing signal.
+        self._prev_poc_price = vp.poc_price
+        self._prev_signed_dist_bps = signed_dist_bps
+
+        def _scale(x: float, lo: float, hi: float) -> float:
+            if hi <= lo:
+                return 1.0
+            return max(0.0, min(1.0, (x - lo) / (hi - lo)))
+
+        conf = min(
+            1.0,
+            0.40
+            + 0.30 * _scale(of.absorption, self._poc_abs_min, self._poc_abs_min * 2.0)
+            + 0.20 * _scale(of.imbalance, self._imb_min, self._imb_min * 2.0)
+            + 0.10 * _scale(of.ob_imbalance, self._poc_ob_min, self._poc_ob_min * 2.0),
+        )
+        return self._make_signal(conditions, confidence=conf)
 
 
 # ════════════════════════════════════════════════════════════════════════════════
@@ -263,3 +333,204 @@ class VALBounceLong(SignalModule):
             "htf_not_bearish":    (not self._htf_align) or structure.trend.value != "bearish",
         }
         return self._make_signal(conditions)
+
+
+# ════════════════════════════════════════════════════════════════════════════════
+#  5. POC ACCEPTANCE + RETEST LONG  ← BREAKOUT/ACCEPTANCE CORE
+#
+#  Breakout systems should not enter on the impulse candle.
+#  They enter after acceptance (holds outside level) and a retest.
+# ════════════════════════════════════════════════════════════════════════════════
+
+@dataclass(slots=True)
+class _AcceptanceState:
+    stage: str = "idle"               # idle|accepting|accepted
+    accept_count: int = 0
+    accepted_level: float | None = None
+    accepted_ts_ms: int | None = None
+
+
+class POCAcceptanceRetestLong(SignalModule):
+    label = "poc_acceptance_retest_long"
+    side = OrderSide.BUY
+
+    def __init__(
+        self,
+        poc_band_bps: float = 8.0,
+        acceptance_evals: int = 2,
+        retest_band_bps: float = 10.0,
+        retest_window_evals: int = 6,
+        absorption_min: float = 0.06,
+        ob_imb_min: float = 0.03,
+        require_htf_align: bool = True,
+        **_,
+    ) -> None:
+        self._poc_band = float(poc_band_bps)
+        self._accept_n = int(acceptance_evals)
+        self._retest_band = float(retest_band_bps)
+        self._retest_window = int(retest_window_evals)
+        self._abs_min = float(absorption_min)
+        self._ob_min = float(ob_imb_min)
+        self._htf_align = bool(require_htf_align)
+        self._state = _AcceptanceState()
+        self._evals_since_accept = 0
+        self._prev_signed_dist_bps: float | None = None
+
+    def evaluate(
+        self,
+        snap: "MultiTFSnapshot",
+        structure: "MarketStructureSnapshot",
+        session: "SessionState",
+        vp: Optional["VolumeProfileSnapshot"] = None,
+    ) -> EntrySignal | None:
+        if not session.active or vp is None or not vp.is_valid or vp.poc_price is None:
+            self._state = _AcceptanceState()
+            self._evals_since_accept = 0
+            self._prev_signed_dist_bps = None
+            return None
+
+        px = float(snap.ltf.close_price)
+        of = snap.ltf.flow
+        signed = (px - vp.poc_price) / vp.poc_price * 10_000.0
+        broke_up = (self._prev_signed_dist_bps is not None) and (
+            self._prev_signed_dist_bps <= self._poc_band and signed > self._poc_band
+        )
+        self._prev_signed_dist_bps = signed
+
+        # Stage 1: detect breakout and start acceptance counter
+        if self._state.stage == "idle":
+            if broke_up and not vp.at_lvn:
+                self._state.stage = "accepting"
+                self._state.accept_count = 1
+                self._state.accepted_level = float(vp.poc_price)
+            return None
+
+        # Stage 2: acceptance = hold above POC band for N evals
+        if self._state.stage == "accepting":
+            if signed > self._poc_band:
+                self._state.accept_count += 1
+                if self._state.accept_count >= self._accept_n:
+                    self._state.stage = "accepted"
+                    self._state.accepted_ts_ms = int(snap.ltf.ts_ms)
+                    self._evals_since_accept = 0
+            else:
+                self._state = _AcceptanceState()  # failed acceptance
+            return None
+
+        # Stage 3: retest within band, but still above (no failure back below)
+        self._evals_since_accept += 1
+        if self._evals_since_accept > self._retest_window:
+            self._state = _AcceptanceState()
+            return None
+
+        near_poc = abs(signed) <= self._retest_band and signed >= -1.0
+        conditions = {
+            "accepted_outside_poc": True,
+            "retest_near_poc": near_poc,
+            "not_at_lvn": not vp.at_lvn,
+            # Context must be bullish: blocks longs when value is accepting lower.
+            "above_poc_context": signed >= 0.0,
+            "cvd_rising": snap.ltf.cvd_rising,
+            "absorption_ok": of.absorption >= self._abs_min,
+            "ob_ok": of.ob_imbalance >= self._ob_min,
+            # Trend-following: in bull runs this blocks countertrend longs from firing in chop.
+            "htf_bullish_or_bos": (not self._htf_align) or (
+                structure.trend.value == "bullish"
+                or (structure.structure_break and structure.break_type == "high")
+            ),
+        }
+        sig = self._make_signal(conditions)
+        if sig:
+            # Reset after firing to avoid duplicate entries on next eval.
+            self._state = _AcceptanceState()
+            self._evals_since_accept = 0
+        return sig
+
+
+class VAHAcceptanceLong(SignalModule):
+    label = "vah_acceptance_long"
+    side = OrderSide.BUY
+
+    def __init__(
+        self,
+        va_band_bps: float = 10.0,
+        acceptance_evals: int = 2,
+        retest_band_bps: float = 12.0,
+        retest_window_evals: int = 6,
+        absorption_min: float = 0.05,
+        ob_imb_min: float = 0.03,
+        require_htf_align: bool = True,
+        **_,
+    ) -> None:
+        self._va_band = float(va_band_bps)
+        self._accept_n = int(acceptance_evals)
+        self._retest_band = float(retest_band_bps)
+        self._retest_window = int(retest_window_evals)
+        self._abs_min = float(absorption_min)
+        self._ob_min = float(ob_imb_min)
+        self._htf_align = bool(require_htf_align)
+        self._state = _AcceptanceState()
+        self._evals_since_accept = 0
+        self._prev_dist_bps: float | None = None
+
+    def evaluate(
+        self,
+        snap: "MultiTFSnapshot",
+        structure: "MarketStructureSnapshot",
+        session: "SessionState",
+        vp: Optional["VolumeProfileSnapshot"] = None,
+    ) -> EntrySignal | None:
+        if not session.active or vp is None or not vp.is_valid or vp.vah_price is None:
+            self._state = _AcceptanceState()
+            self._evals_since_accept = 0
+            self._prev_dist_bps = None
+            return None
+
+        px = float(snap.ltf.close_price)
+        of = snap.ltf.flow
+        dist = (px - vp.vah_price) / vp.vah_price * 10_000.0  # positive above VAH
+        broke_up = (self._prev_dist_bps is not None) and (self._prev_dist_bps <= self._va_band and dist > self._va_band)
+        self._prev_dist_bps = dist
+
+        if self._state.stage == "idle":
+            if broke_up and not vp.at_lvn:
+                self._state.stage = "accepting"
+                self._state.accept_count = 1
+                self._state.accepted_level = float(vp.vah_price)
+            return None
+
+        if self._state.stage == "accepting":
+            if dist > self._va_band:
+                self._state.accept_count += 1
+                if self._state.accept_count >= self._accept_n:
+                    self._state.stage = "accepted"
+                    self._state.accepted_ts_ms = int(snap.ltf.ts_ms)
+                    self._evals_since_accept = 0
+            else:
+                self._state = _AcceptanceState()
+            return None
+
+        self._evals_since_accept += 1
+        if self._evals_since_accept > self._retest_window:
+            self._state = _AcceptanceState()
+            return None
+
+        near_vah = abs(dist) <= self._retest_band and dist >= -1.0
+        conditions = {
+            "accepted_outside_vah": True,
+            "retest_near_vah": near_vah,
+            "not_at_lvn": not vp.at_lvn,
+            "above_poc_context": vp.above_poc,
+            "cvd_rising": snap.ltf.cvd_rising,
+            "absorption_ok": of.absorption >= self._abs_min,
+            "ob_ok": of.ob_imbalance >= self._ob_min,
+            "htf_bullish_or_bos": (not self._htf_align) or (
+                structure.trend.value == "bullish"
+                or (structure.structure_break and structure.break_type == "high")
+            ),
+        }
+        sig = self._make_signal(conditions)
+        if sig:
+            self._state = _AcceptanceState()
+            self._evals_since_accept = 0
+        return sig

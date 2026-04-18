@@ -22,7 +22,6 @@ def _load_file(path: Path) -> dict[str, Any]:
     if path.suffix.lower() in {".yaml", ".yml"}:
         try:
             import yaml  # type: ignore
-
             data = yaml.safe_load(text)
         except ImportError as e:
             raise ImportError(
@@ -72,6 +71,9 @@ def load_orderflow_config(path: str | Path) -> OrderflowNautilusConfig:
         force_exit_path=risk_raw.get("force_exit_path", "orderflow/.force_exit"),
         loss_cooldown_secs=float(risk_raw.get("loss_cooldown_secs", 0.0)),
         min_hold_secs=float(risk_raw.get("min_hold_secs", 0.0)),
+        risk_per_trade_pct=float(risk_raw.get("risk_per_trade_pct", 0.0025)),
+        min_stop_bps=float(risk_raw.get("min_stop_bps", 12.0)),
+        max_stop_bps=float(risk_raw.get("max_stop_bps", 250.0)),
     )
     execution = ExecutionParams(
         # Prefer safer, more configurable execution defaults.
@@ -81,6 +83,18 @@ def load_orderflow_config(path: str | Path) -> OrderflowNautilusConfig:
         trailing_trigger_pct=float(exec_raw.get("trailing_trigger_pct", 0.015)),
         trailing_offset_pct=float(exec_raw.get("trailing_offset_pct", 0.01)),
         max_time_in_trade_secs=exec_raw.get("max_time_in_trade_secs"),
+        max_entry_drift_bps=float(exec_raw.get("max_entry_drift_bps", 8.0)),
+        backtest_fee_rate=float(exec_raw.get("backtest_fee_rate", 0.0004)),
+        backtest_slippage_rate=float(exec_raw.get("backtest_slippage_rate", 0.0002)),
+        min_structural_rr=float(exec_raw.get("min_structural_rr", 1.2)),
+        max_structural_stop_bps=float(exec_raw.get("max_structural_stop_bps", 35.0)),
+        short_rejection_min_confidence=float(exec_raw.get("short_rejection_min_confidence", 1.05)),
+        short_rejection_size_mult=float(exec_raw.get("short_rejection_size_mult", 0.6)),
+        early_invalidation_secs=float(exec_raw.get("early_invalidation_secs", 120.0)),
+        early_invalidation_loss_pct=float(exec_raw.get("early_invalidation_loss_pct", 0.0018)),
+        min_hold_secs=float(exec_raw.get("min_hold_secs", 10.0)),
+        acceptance_failure_secs=float(exec_raw.get("acceptance_failure_secs", 60.0)),
+        acceptance_failure_evals=int(exec_raw.get("acceptance_failure_evals", 2)),
     )
     signals_config = SignalsConfig(
         long=list(signals_raw.get("long", ["hvn_absorption_long"])),
@@ -102,6 +116,7 @@ def load_orderflow_config(path: str | Path) -> OrderflowNautilusConfig:
         require_orderbook=bool(raw.get("require_orderbook", True)),
         signals_config=signals_config,
         vp_config=raw.get("vp_config"),
+        heatmap_config=raw.get("heatmap_config"),
         signal=signal,
         risk=risk,
         execution=execution,
