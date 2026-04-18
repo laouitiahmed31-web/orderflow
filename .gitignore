@@ -140,3 +140,6 @@ orderflow/logs/
 ticks/
 *.csv
 *.zip
+
+# Documentation
+*.md
